@@ -241,7 +241,8 @@ class YoloActionServer:
         qx, qy, qz, qw = quaternion_from_euler(roll, pitch_from_center, yaw_from_center)
 
         poi_msg = QuaternionStamped()
-        poi_msg.header.stamp = self._node.get_clock().now().to_msg()
+        # poi_msg.header.stamp = self._node.get_clock().now().to_msg() #NOTE original
+        poi_msg.header.stamp = msg.header.stamp #NOTE use the msg header instead
         poi_msg.header.frame_id = self.camera_frame_id
         poi_msg.quaternion.x = qx
         poi_msg.quaternion.y = qy
