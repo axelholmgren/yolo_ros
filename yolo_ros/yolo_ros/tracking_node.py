@@ -1,180 +1,277 @@
-import math
+# Copyright (C) 2023 Miguel Ángel González Santamarta
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
 
 import rclpy
-from geometry_msgs.msg import Quaternion, TransformStamped
-from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
-from rclpy.time import Time
-from tf2_msgs.msg import TFMessage
-from tf2_ros import (
-    Buffer,
-    TransformBroadcaster,
-    TransformException,
-    TransformListener,
-)
+from rclpy.qos import QoSProfile
+from rclpy.qos import QoSHistoryPolicy
+from rclpy.qos import QoSDurabilityPolicy
+from rclpy.qos import QoSReliabilityPolicy
+from rclpy.lifecycle import LifecycleNode
+from rclpy.lifecycle import TransitionCallbackReturn
+from rclpy.lifecycle import LifecycleState
 
-from .gimbal_yaw_correction import correct_yaw
+import cv2
+import numpy as np
+import message_filters
+from cv_bridge import CvBridge
 
+from ultralytics.engine.results import Boxes
+from ultralytics.trackers.basetrack import BaseTrack
+from ultralytics.trackers import BOTSORT, BYTETracker
+from ultralytics.utils import IterableSimpleNamespace, YAML
+from ultralytics.utils.checks import check_requirements, check_yaml
 
-def yaw_from_quaternion(q):
-    return math.atan2(
-        2.0 * (q.w * q.z + q.x * q.y),
-        1.0 - 2.0 * (q.y * q.y + q.z * q.z),
-    )
-
-
-def yaw_quaternion(yaw):
-    return Quaternion(
-        z=math.sin(yaw / 2.0),
-        w=math.cos(yaw / 2.0),
-    )
+from sensor_msgs.msg import Image
+from yolo_msgs.msg import Detection
+from yolo_msgs.msg import DetectionArray
 
 
-def multiply_quaternions(left, right):
-    return Quaternion(
-        x=left.w * right.x + left.x * right.w + left.y * right.z
-        - left.z * right.y,
-        y=left.w * right.y - left.x * right.z + left.y * right.w
-        + left.z * right.x,
-        z=left.w * right.z + left.x * right.y - left.y * right.x
-        + left.z * right.w,
-        w=left.w * right.w - left.x * right.x - left.y * right.y
-        - left.z * right.z,
-    )
-
-
-class CalibratedCameraTFNode(Node):
+class TrackingNode(LifecycleNode):
     """
-    Raw TF -> correction curve -> calibrated TF.
+    ROS 2 Lifecycle Node for object tracking.
 
-    Leaves the raw TF tree unchanged and publishes a separate
-    calibrated camera frame.
+    This node tracks detected objects across frames using BYTE or BOT-SORT algorithms.
+    It subscribes to detections and image topics and publishes tracked detections with IDs.
     """
 
-    def __init__(self):
-        super().__init__("calibrated_camera_tf_node")
+    def __init__(self) -> None:
+        """
+        Initialize the tracking node.
 
-        self.declare_parameter("base_frame", "evolo/z1_base_link")
-        self.declare_parameter("yaw_frame", "evolo/z1_yaw_link")
-        self.declare_parameter("camera_frame", "evolo/z1_camera_link")
-        self.declare_parameter(
-            "calibrated_camera_frame",
-            "evolo/z1_camera_calibrated_link",
+        Declares ROS parameters for tracker configuration.
+        """
+        super().__init__("tracking_node")
+
+        # Params
+        self.declare_parameter("tracker", "bytetrack.yaml")
+        self.declare_parameter("image_reliability", QoSReliabilityPolicy.BEST_EFFORT)
+
+        self.cv_bridge = CvBridge()
+
+    def on_configure(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Configure lifecycle callback.
+
+        Retrieves parameters, creates the tracker instance, and sets up publishers.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Configuring...")
+
+        tracker_name = self.get_parameter("tracker").get_parameter_value().string_value
+
+        self.image_reliability = (
+            self.get_parameter("image_reliability").get_parameter_value().integer_value
         )
 
-        self.declare_parameter("yaw_correction_mode", "absolute")
-        self.declare_parameter("negate_yaw_correction", False)
+        self.tracker = self.create_tracker(tracker_name)
+        self._pub = self.create_publisher(DetectionArray, "tracking", 10)
 
-        self.base_frame = self.get_parameter("base_frame").value
-        self.yaw_frame = self.get_parameter("yaw_frame").value
-        self.camera_frame = self.get_parameter("camera_frame").value
-        self.calibrated_camera_frame = self.get_parameter(
-            "calibrated_camera_frame"
-        ).value
+        super().on_configure(state)
+        self.get_logger().info(f"[{self.get_name()}] Configured")
 
-        self.correction_mode = self.get_parameter(
-            "yaw_correction_mode"
-        ).value
-        self.negate_correction = self.get_parameter(
-            "negate_yaw_correction"
-        ).value
+        return TransitionCallbackReturn.SUCCESS
 
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.tf_broadcaster = TransformBroadcaster(self)
+    def on_activate(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Activate lifecycle callback.
 
-        self.create_subscription(
-            TFMessage,
-            "/tf",
-            self.tf_callback,
-            qos_profile_sensor_data,
+        Creates subscriptions to image and detection topics with time synchronization.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Activating...")
+
+        image_qos_profile = QoSProfile(
+            reliability=self.image_reliability,
+            history=QoSHistoryPolicy.KEEP_LAST,
+            durability=QoSDurabilityPolicy.VOLATILE,
+            depth=1,
         )
 
-    def tf_callback(self, msg):
-        base_to_yaw = next(
-            (
-                tf
-                for tf in msg.transforms
-                if tf.header.frame_id == self.base_frame
-                and tf.child_frame_id == self.yaw_frame
-            ),
-            None,
+        # Subs
+        self.image_sub = message_filters.Subscriber(
+            self, Image, "image_raw", qos_profile=image_qos_profile
+        )
+        self.detections_sub = message_filters.Subscriber(
+            self, DetectionArray, "detections", qos_profile=10
         )
 
-        if base_to_yaw is None:
-            return
+        self._synchronizer = message_filters.ApproximateTimeSynchronizer(
+            (self.image_sub, self.detections_sub), 10, 0.5
+        )
+        self._synchronizer.registerCallback(self.detections_cb)
 
-        self.publish_corrected_transform(base_to_yaw)
+        super().on_activate(state)
+        self.get_logger().info(f"[{self.get_name()}] Activated")
 
-    def publish_corrected_transform(self, base_to_yaw):
-        stamp = Time.from_msg(base_to_yaw.header.stamp)
+        return TransitionCallbackReturn.SUCCESS
 
-        try:
-            yaw_to_camera = self.tf_buffer.lookup_transform(
-                self.yaw_frame,
-                self.camera_frame,
-                stamp,
+    def on_deactivate(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Deactivate lifecycle callback.
+
+        Destroys subscriptions and cleans up the synchronizer.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Deactivating...")
+
+        self.destroy_subscription(self.image_sub.sub)
+        self.destroy_subscription(self.detections_sub.sub)
+
+        del self._synchronizer
+        self._synchronizer = None
+
+        super().on_deactivate(state)
+        self.get_logger().info(f"[{self.get_name()}] Deactivated")
+
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_cleanup(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Cleanup lifecycle callback.
+
+        Destroys the tracker instance and cleans up resources.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Cleaning up...")
+
+        del self.tracker
+
+        super().on_cleanup(state)
+        self.get_logger().info(f"[{self.get_name()}] Cleaned up")
+
+        return TransitionCallbackReturn.SUCCESS
+
+    def on_shutdown(self, state: LifecycleState) -> TransitionCallbackReturn:
+        """
+        Shutdown lifecycle callback.
+
+        Performs final cleanup before node shutdown.
+
+        @param state Current lifecycle state
+        @return Transition callback return status
+        """
+        self.get_logger().info(f"[{self.get_name()}] Shutting down...")
+        super().on_shutdown(state)
+        self.get_logger().info(f"[{self.get_name()}] Shutted down")
+        return TransitionCallbackReturn.SUCCESS
+
+    def create_tracker(self, tracker_yaml: str) -> BaseTrack:
+        """
+        Create a tracker instance from configuration.
+
+        Loads tracker configuration from YAML file and instantiates the appropriate tracker.
+
+        @param tracker_yaml Path to tracker configuration YAML file
+        @return Initialized tracker instance
+        """
+
+        TRACKER_MAP = {"bytetrack": BYTETracker, "botsort": BOTSORT}
+        check_requirements("lap")  # For linear_assignment
+
+        tracker = check_yaml(tracker_yaml)
+        cfg = IterableSimpleNamespace(**YAML.load(tracker))
+
+        assert cfg.tracker_type in [
+            "bytetrack",
+            "botsort",
+        ], f"Only support 'bytetrack' and 'botsort' for now, but got '{cfg.tracker_type}'"
+        tracker = TRACKER_MAP[cfg.tracker_type](args=cfg, frame_rate=10)
+        return tracker
+
+    def detections_cb(self, img_msg: Image, detections_msg: DetectionArray) -> None:
+        """
+        Synchronized callback for image and detections.
+
+        Performs tracking on detections and publishes tracked results with IDs.
+
+        @param img_msg Image message
+        @param detections_msg Detections message
+        """
+
+        tracked_detections_msg = DetectionArray()
+        tracked_detections_msg.header = img_msg.header
+
+        # Convert image
+        cv_image = self.cv_bridge.imgmsg_to_cv2(img_msg, desired_encoding="bgr8")
+        cv_image = cv2.cvtColor(cv_image, cv2.COLOR_BGR2RGB)
+
+        # Parse detections
+        detection_list = []
+        detection: Detection
+        for detection in detections_msg.detections:
+
+            detection_list.append(
+                [
+                    detection.bbox.center.position.x - detection.bbox.size.x / 2,
+                    detection.bbox.center.position.y - detection.bbox.size.y / 2,
+                    detection.bbox.center.position.x + detection.bbox.size.x / 2,
+                    detection.bbox.center.position.y + detection.bbox.size.y / 2,
+                    detection.score,
+                    detection.class_id,
+                ]
             )
-        except TransformException:
-            return
 
-        raw_yaw_deg = math.degrees(
-            yaw_from_quaternion(base_to_yaw.transform.rotation)
-        )
+        # Tracking
+        if len(detection_list) > 0:
 
-        result = correct_yaw(
-            raw_yaw_deg,
-            mode=self.correction_mode,
-            negate=self.negate_correction,
-        )
+            det = Boxes(np.array(detection_list), (img_msg.height, img_msg.width))
+            tracks = self.tracker.update(det, cv_image)
 
-        if not bool(result.valid):
-            return
+            if len(tracks) > 0:
 
-        delta_yaw = math.radians(
-            float(result.yaw_deg) - raw_yaw_deg
-        )
+                for t in tracks:
 
-        delta_rotation = yaw_quaternion(delta_yaw)
-        translation = yaw_to_camera.transform.translation
+                    tracked_box = Boxes(t[:-1], (img_msg.height, img_msg.width))
+                    tracked_detection: Detection = detections_msg.detections[int(t[-1])]
 
-        corrected = TransformStamped()
-        corrected.header.stamp = base_to_yaw.header.stamp
-        corrected.header.frame_id = self.yaw_frame
-        corrected.child_frame_id = self.calibrated_camera_frame
+                    # Get boxes values
+                    box = tracked_box.xywh[0]
+                    tracked_detection.bbox.center.position.x = float(box[0])
+                    tracked_detection.bbox.center.position.y = float(box[1])
+                    tracked_detection.bbox.size.x = float(box[2])
+                    tracked_detection.bbox.size.y = float(box[3])
 
-        c = math.cos(delta_yaw)
-        s = math.sin(delta_yaw)
+                    # Get track ID
+                    track_id = ""
+                    if tracked_box.is_track:
+                        track_id = str(int(tracked_box.id))
+                    tracked_detection.id = track_id
 
-        corrected.transform.translation.x = (
-            c * translation.x - s * translation.y
-        )
-        corrected.transform.translation.y = (
-            s * translation.x + c * translation.y
-        )
-        corrected.transform.translation.z = translation.z
+                    # Append msg
+                    tracked_detections_msg.detections.append(tracked_detection)
 
-        corrected.transform.rotation = multiply_quaternions(
-            delta_rotation,
-            yaw_to_camera.transform.rotation,
-        )
-
-        self.tf_broadcaster.sendTransform(corrected)
+        # Publish detections
+        self._pub.publish(tracked_detections_msg)
 
 
 def main():
     rclpy.init()
-
-    node = CalibratedCameraTFNode()
+    node = TrackingNode()
+    node.trigger_configure()
+    node.trigger_activate()
 
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-if __name__ == "__main__":
-    main()
