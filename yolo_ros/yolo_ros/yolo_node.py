@@ -512,7 +512,8 @@ class YoloNode(LifecycleNode):
 
         try:
             self.get_logger().info(f"Setting classes: {req.classes}")
-            self.yolo.set_classes(req.classes)
+            with torch.autocast("cuda", enabled=self.half):
+                self.yolo.set_classes(req.classes)
             self.get_logger().info(f"New classes: {self.yolo.names}")
         except Exception as e:
             self.get_logger().error(f"Error setting classes: {e}")
